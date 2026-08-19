@@ -8,9 +8,17 @@
  */
 
 import { v } from "convex/values";
+import { internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import { internalMutation, internalQuery } from "./_generated/server";
 import { callDirection, callStatus } from "./schema";
+
+const TERMINAL_CALL_STATUSES = new Set([
+	"completed",
+	"terminated",
+	"rejected",
+	"failed",
+]);
 
 /**
  * Create a call record. Used both when sending a Call Permission Request
@@ -94,5 +102,61 @@ export const getCallInternal = internalQuery({
 	args: { callId: v.id("calls") },
 	handler: async (ctx, args) => {
 		return await ctx.db.get(args.callId);
+	},
+});
+
+/**
+ * Correlate a self-hosted voice-agent (Dograh) session with a call.
+ *
+ * Called by the media bridge (via gateway.attachCallSession) once it has
+ * bridged the WhatsApp call audio into a Dograh session. Optionally advances
+ * the call status (e.g. to "connected" when media is established).
+ *
+ * This is the Phase 3 seam between the Pons control plane and the media plane
+ * (Asterisk → Dograh). Audio never touches Convex; only the session id and
+ * status do.
+ */
+export const attachDograhSession = internalMutation({
+	args: {
+		waCallId: v.string(),
+		dograhSessionId: v.string(),
+		status: v.optional(callStatus),
+	},
+	handler: async (ctx, args) => {
+		const call = await ctx.db
+			.query("calls")
+			.withIndex("by_wa_call_id", (q) => q.eq("waCallId", args.waCallId))
+			.first();
+		if (!call) return { found: false };
+
+		const now = Date.now();
+		await ctx.db.patch(call._id, {
+			dograhSessionId: args.dograhSessionId,
+			...(args.status ? { status: args.status } : {}),
+			...(args.status === "connected" ? { connectedAt: now } : {}),
+			...(args.status && TERMINAL_CALL_STATUSES.has(args.status)
+				? { endedAt: now }
+				: {}),
+		});
+
+		if (args.status) {
+			await ctx.runMutation(internal.forwarding.enqueueEvent, {
+				accountId: call.accountId,
+				eventType: "call.status.updated",
+				source: "media_bridge",
+				occurredAt: now,
+				dedupeKey: `${args.waCallId}:${args.status}:${args.dograhSessionId}`,
+				payload: {
+					callId: call._id,
+					waCallId: args.waCallId,
+					dograhSessionId: args.dograhSessionId,
+					direction: call.direction,
+					status: args.status,
+					timestamp: now,
+				},
+			});
+		}
+
+		return { found: true, callId: call._id };
 	},
 });

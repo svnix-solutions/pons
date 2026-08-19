@@ -100,6 +100,7 @@ export const callDirection = v.union(
 export const webhookForwardSource = v.union(
 	v.literal("meta_webhook"),
 	v.literal("pons_send"),
+	v.literal("media_bridge"), // Phase 3: voice-agent (Dograh) session correlation
 );
 
 export default defineSchema({

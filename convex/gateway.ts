@@ -963,3 +963,70 @@ export const webhookCallEvent = action({
 		});
 	},
 });
+
+/**
+ * Length-preserving constant-time string comparison (pure JS — Convex isolates
+ * lack node:crypto). The length check leaks length only, which is acceptable
+ * for a shared-secret bearer token.
+ */
+function constantTimeEqual(a: string, b: string): boolean {
+	if (a.length !== b.length) return false;
+	let mismatch = 0;
+	for (let i = 0; i < a.length; i++) {
+		mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	}
+	return mismatch === 0;
+}
+
+/**
+ * Correlate a Dograh voice-agent session with a WhatsApp call (Phase 3 media
+ * bridge → Pons). Authenticated with the MEDIA_BRIDGE_SECRET shared secret
+ * (verified here as defense-in-depth even though the Next.js route also checks
+ * it, mirroring how webhook actions re-verify the signature inside Convex).
+ */
+export const attachCallSession = action({
+	args: {
+		secret: v.string(),
+		waCallId: v.string(),
+		dograhSessionId: v.string(),
+		status: v.optional(v.string()),
+	},
+	handler: async (
+		ctx,
+		args,
+	): Promise<{ found: boolean; callId?: Id<"calls"> }> => {
+		const expected = process.env.MEDIA_BRIDGE_SECRET;
+		if (!expected) {
+			throw new Error("MEDIA_BRIDGE_SECRET is not configured");
+		}
+		if (!constantTimeEqual(args.secret, expected)) {
+			throw new Error("Unauthorized");
+		}
+
+		// Validate the reported status against our lifecycle vocabulary.
+		const allowedStatuses = new Set([
+			"connecting",
+			"connected",
+			"completed",
+			"terminated",
+			"rejected",
+			"failed",
+		]);
+		const status =
+			args.status && allowedStatuses.has(args.status)
+				? (args.status as
+						| "connecting"
+						| "connected"
+						| "completed"
+						| "terminated"
+						| "rejected"
+						| "failed")
+				: undefined;
+
+		return await ctx.runMutation(internal.calls.attachDograhSession, {
+			waCallId: args.waCallId,
+			dograhSessionId: args.dograhSessionId,
+			status,
+		});
+	},
+});
