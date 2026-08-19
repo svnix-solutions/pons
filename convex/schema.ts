@@ -62,11 +62,45 @@ export const webhookForwardEventType = v.union(
 	v.literal("message.outbound.sent"),
 	v.literal("message.outbound.failed"),
 	v.literal("message.status.updated"),
+	// ── Calling (voice agent) ──
+	// Phase 1 emits the outbound-initiated events (permission.requested /
+	// initiated / terminated / failed). Phase 2 adds the webhook-driven
+	// lifecycle events below.
+	v.literal("call.permission.requested"),
+	v.literal("call.initiated"),
+	v.literal("call.terminated"),
+	v.literal("call.failed"),
+	// Phase 2 — inbound webhook (Meta `calls` field):
+	v.literal("call.inbound.received"), // a user-initiated call arrived
+	v.literal("call.status.updated"), // ringing / connected / completed / rejected
+);
+
+// Lifecycle states for a WhatsApp voice call.
+// `permission_*` cover the consent handshake; the rest track the call itself.
+// Inbound webhook events (Phase 2) drive ringing → connected → completed.
+export const callStatus = v.union(
+	v.literal("permission_requested"),
+	v.literal("permission_granted"),
+	v.literal("permission_denied"),
+	v.literal("initiated"),
+	v.literal("ringing"),
+	v.literal("connecting"),
+	v.literal("connected"),
+	v.literal("completed"),
+	v.literal("terminated"),
+	v.literal("rejected"),
+	v.literal("failed"),
+);
+
+export const callDirection = v.union(
+	v.literal("inbound"),
+	v.literal("outbound"),
 );
 
 export const webhookForwardSource = v.union(
 	v.literal("meta_webhook"),
 	v.literal("pons_send"),
+	v.literal("media_bridge"), // Phase 3: voice-agent (Dograh) session correlation
 );
 
 export default defineSchema({
@@ -361,6 +395,52 @@ export default defineSchema({
 			searchField: "text",
 			filterFields: ["accountId"],
 		}),
+
+	// ── WhatsApp voice calls ──
+	//
+	// One row per call attempt, including the consent handshake. Created when we
+	// send a Call Permission Request or initiate a call; updated as lifecycle
+	// events arrive (Phase 2 webhook ingest) and correlated to the self-hosted
+	// voice agent via `dograhSessionId` (Phase 3 media bridge).
+	//
+	// The control plane (this table + convex/whatsappCalls.ts) never carries
+	// audio — media flows WhatsApp → SIP/Asterisk → Dograh, outside Convex.
+	calls: defineTable({
+		accountId: v.id("accounts"),
+		conversationId: v.optional(v.id("conversations")),
+		contactId: v.optional(v.id("contacts")),
+		direction: callDirection,
+		to: v.string(), // Recipient in E.164 / wa_id form
+
+		// Meta's call identifier (wacid...). Set once a call is connected —
+		// a bare permission request has no call id yet.
+		waCallId: v.optional(v.string()),
+
+		status: callStatus,
+
+		// Voice-agent correlation (set by the media layer in Phase 3).
+		dograhSessionId: v.optional(v.string()),
+
+		// Consent tracking. `permissionExpiresAt` bounds the 7-day call window
+		// once the user grants permission.
+		permissionExpiresAt: v.optional(v.number()),
+
+		// Echoed back on webhook events for correlation (biz_opaque_callback_data).
+		callbackData: v.optional(v.string()),
+
+		// Failure detail (mirrors messages table conventions).
+		errorCode: v.optional(v.string()),
+		errorMessage: v.optional(v.string()),
+
+		// Timeline (all optional — populated as the call progresses).
+		requestedAt: v.optional(v.number()), // Permission request sent
+		initiatedAt: v.optional(v.number()), // POST /calls connect accepted
+		connectedAt: v.optional(v.number()), // Media established
+		endedAt: v.optional(v.number()), // Terminated / completed / failed
+	})
+		.index("by_account", ["accountId"])
+		.index("by_wa_call_id", ["waCallId"])
+		.index("by_conversation", ["conversationId"]),
 
 	// Webhook logs (for debugging)
 	webhookLogs: defineTable({

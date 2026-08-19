@@ -1,9 +1,66 @@
-import { v } from "convex/values";
+import { type Infer, v } from "convex/values";
 import { internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import { internalAction, internalMutation } from "./_generated/server";
 import { getOwnerAccessToken } from "./helpers";
 import { metaFetch } from "./metaFetch";
+import type { callStatus } from "./schema";
+
+type CallStatus = Infer<typeof callStatus>;
+
+// Precedence for call lifecycle, mirroring the message statusOrder guard: a
+// webhook that arrives out of order must not downgrade a call already further
+// along. Terminal states (>= 6) always win.
+const callStatusOrder: Record<CallStatus, number> = {
+	permission_requested: 0,
+	permission_denied: 0,
+	permission_granted: 1,
+	initiated: 2,
+	ringing: 3,
+	connecting: 4,
+	connected: 5,
+	completed: 6,
+	terminated: 6,
+	rejected: 6,
+	failed: 6,
+};
+
+/**
+ * Map a Meta `calls` webhook event/status to our lifecycle state.
+ *
+ * NOTE: field names/values are based on Meta's documented calling webhook
+ * (`event`: connect/terminate; `status`: RINGING/ACCEPTED/REJECTED/COMPLETED).
+ * The exact enum casing should be validated against a real payload (Phase 0
+ * spike). Parsing is intentionally tolerant — unknown shapes return null and
+ * are logged rather than throwing.
+ */
+function mapCallEvent(
+	event: string | undefined,
+	status: string | undefined,
+): { status: CallStatus; connected: boolean; terminal: boolean } | null {
+	const e = event?.toLowerCase();
+	if (e === "terminate")
+		return { status: "terminated", connected: false, terminal: true };
+	if (e === "connect")
+		return { status: "connecting", connected: false, terminal: false };
+
+	switch (status?.toUpperCase()) {
+		case "RINGING":
+			return { status: "ringing", connected: false, terminal: false };
+		case "ACCEPTED":
+		case "IN_PROGRESS":
+			return { status: "connected", connected: true, terminal: false };
+		case "REJECTED":
+			return { status: "rejected", connected: false, terminal: true };
+		case "COMPLETED":
+			return { status: "completed", connected: false, terminal: true };
+		case "MISSED":
+		case "FAILED":
+			return { status: "failed", connected: false, terminal: true };
+		default:
+			return null;
+	}
+}
 
 // Message types
 type MessageType =
@@ -153,6 +210,151 @@ export const ingestStatusUpdate = internalMutation({
 		});
 
 		return { found: true, updated: true };
+	},
+});
+
+/**
+ * Ingest a WhatsApp call lifecycle event from the `calls` webhook field.
+ *
+ * Matches an existing call by waCallId (business-initiated calls are created in
+ * whatsappCalls.initiateCall) and advances its status; for an unknown waCallId
+ * (typically a user-initiated inbound call) a new call record is created.
+ *
+ * Durable mutation — retried automatically. The account is resolved in the
+ * gateway and passed in, matching webhookStatusUpdate.
+ */
+export const ingestCallEvent = internalMutation({
+	args: {
+		accountId: v.id("accounts"),
+		waCallId: v.string(),
+		event: v.optional(v.string()),
+		status: v.optional(v.string()),
+		timestamp: v.number(),
+		direction: v.optional(v.string()), // BUSINESS_INITIATED | USER_INITIATED
+		from: v.optional(v.string()),
+		to: v.optional(v.string()),
+		callbackData: v.optional(v.string()),
+		errorCode: v.optional(v.string()),
+		errorMessage: v.optional(v.string()),
+	},
+	handler: async (ctx, args) => {
+		const mapped = mapCallEvent(args.event, args.status);
+		if (!mapped) {
+			console.warn("[webhook] Unrecognized call event/status", {
+				waCallId: args.waCallId,
+				event: args.event,
+				status: args.status,
+			});
+			return { updated: false };
+		}
+
+		const existing = await ctx.db
+			.query("calls")
+			.withIndex("by_wa_call_id", (q) => q.eq("waCallId", args.waCallId))
+			.first();
+
+		// Timeline patch derived from the mapped state.
+		const timeline: {
+			connectedAt?: number;
+			endedAt?: number;
+		} = {};
+		if (mapped.connected) timeline.connectedAt = args.timestamp;
+		if (mapped.terminal) timeline.endedAt = args.timestamp;
+
+		if (existing && existing.accountId === args.accountId) {
+			const currentOrder = callStatusOrder[existing.status] ?? 0;
+			const newOrder = callStatusOrder[mapped.status];
+
+			// Skip out-of-order downgrades unless the new state is terminal.
+			if (newOrder <= currentOrder && !mapped.terminal) {
+				return { found: true, updated: false };
+			}
+
+			await ctx.db.patch(existing._id, {
+				status: mapped.status,
+				errorCode: args.errorCode,
+				errorMessage: args.errorMessage,
+				...timeline,
+			});
+
+			await ctx.runMutation(internal.forwarding.enqueueEvent, {
+				accountId: args.accountId,
+				eventType: "call.status.updated",
+				source: "meta_webhook",
+				occurredAt: args.timestamp,
+				dedupeKey: `${args.waCallId}:${mapped.status}:${args.timestamp}`,
+				payload: {
+					callId: existing._id,
+					waCallId: args.waCallId,
+					direction: existing.direction,
+					status: mapped.status,
+					timestamp: args.timestamp,
+					errorCode: args.errorCode,
+					errorMessage: args.errorMessage,
+				},
+			});
+
+			return { found: true, updated: true };
+		}
+
+		// Unknown call — treat as a newly observed inbound call. Best-effort link
+		// to an existing contact/conversation by the peer number (never creates
+		// one here; that stays with message ingest).
+		const inbound = args.direction?.toUpperCase() !== "BUSINESS_INITIATED";
+		const peer = inbound ? args.from : args.to;
+
+		let contactId: Id<"contacts"> | undefined;
+		let conversationId: Id<"conversations"> | undefined;
+		if (peer) {
+			const waId = peer.replace(/^\+/, "").replace(/[\s\-()]/g, "");
+			const contact = await ctx.db
+				.query("contacts")
+				.withIndex("by_account_wa_id", (q) =>
+					q.eq("accountId", args.accountId).eq("waId", waId),
+				)
+				.first();
+			if (contact) {
+				contactId = contact._id;
+				const conversation = await ctx.db
+					.query("conversations")
+					.withIndex("by_contact", (q) => q.eq("contactId", contact._id))
+					.first();
+				conversationId = conversation?._id;
+			}
+		}
+
+		const callId = await ctx.db.insert("calls", {
+			accountId: args.accountId,
+			conversationId,
+			contactId,
+			direction: inbound ? "inbound" : "outbound",
+			to: args.to ?? args.from ?? "",
+			waCallId: args.waCallId,
+			status: mapped.status,
+			callbackData: args.callbackData,
+			errorCode: args.errorCode,
+			errorMessage: args.errorMessage,
+			...timeline,
+		});
+
+		await ctx.runMutation(internal.forwarding.enqueueEvent, {
+			accountId: args.accountId,
+			eventType: inbound ? "call.inbound.received" : "call.status.updated",
+			source: "meta_webhook",
+			occurredAt: args.timestamp,
+			dedupeKey: `${args.waCallId}:${mapped.status}:${args.timestamp}`,
+			payload: {
+				callId,
+				waCallId: args.waCallId,
+				direction: inbound ? "inbound" : "outbound",
+				status: mapped.status,
+				from: args.from,
+				to: args.to,
+				timestamp: args.timestamp,
+			},
+		});
+
+		return { found: false, created: true, callId };
 	},
 });
 

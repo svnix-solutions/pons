@@ -1,0 +1,34 @@
+# WhatsApp voice-agent media plane — TEMPLATE (Phase 3), not yet validated.
+#
+# Asterisk terminates the WhatsApp SIP + SRTP call and bridges it to a Dograh
+# voice agent over ARI. Dograh is typically run from its own compose stack
+# (see https://github.com/dograh-hq/dograh); the `dograh` service below is a
+# reference placeholder — replace with Dograh's official compose or point
+# Asterisk at an externally-running Dograh via ARI_* / DOGRAH_* in .env.
+#
+# Nothing here carries audio into Pons/Convex. After media is established the
+# bridge posts the Dograh session id to Pons POST /api/media/session.
+
+services:
+  asterisk:
+    image: andrius/asterisk:20-current
+    network_mode: host # SIP/RTP: simplest correct networking for media
+    volumes:
+      - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./asterisk/ari.conf:/etc/asterisk/ari.conf:ro
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  # Reference only — prefer Dograh's official compose stack. Left here to show
+  # where it slots in (ARI client + agent workflow).
+  dograh:
+    image: ghcr.io/dograh-hq/dograh:latest
+    depends_on:
+      - asterisk
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
