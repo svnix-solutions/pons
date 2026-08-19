@@ -1,4 +1,4 @@
-import { v } from "convex/values";
+import { type Infer, v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import {
 	internalQuery,
@@ -10,12 +10,13 @@ import {
 import { auth } from "./auth";
 import { webhookForwardEventType } from "./schema";
 
-const DEFAULT_EVENTS: Array<
-	| "message.inbound.received"
-	| "message.outbound.sent"
-	| "message.outbound.failed"
-	| "message.status.updated"
-> = [
+// Derive the TS type from the schema validator so this never drifts when new
+// event types (e.g. call.*) are added to the union.
+type WebhookForwardEventType = Infer<typeof webhookForwardEventType>;
+
+// New targets subscribe to messaging events by default; callers opt into
+// call.* events explicitly.
+const DEFAULT_EVENTS: Array<WebhookForwardEventType> = [
 	"message.inbound.received",
 	"message.outbound.sent",
 	"message.outbound.failed",
@@ -198,12 +199,7 @@ export const update = mutation({
 			name?: string;
 			url?: string;
 			enabled?: boolean;
-			subscribedEvents?: Array<
-				| "message.inbound.received"
-				| "message.outbound.sent"
-				| "message.outbound.failed"
-				| "message.status.updated"
-			>;
+			subscribedEvents?: Array<WebhookForwardEventType>;
 			maxAttempts?: number;
 			timeoutMs?: number;
 		} = {

@@ -70,6 +70,17 @@ export const formatMetaError = (error: MetaApiError | undefined): string => {
 		return `${base}\n\nThe template was not found or is not approved. Check the template name and language code.`;
 	}
 
+	// ── Calling (voice agent) ──
+	// Text-based heuristics: Meta's calling error subcodes are not yet pinned
+	// down here, so match on the message and degrade gracefully otherwise.
+	const lower = error.message.toLowerCase();
+	if (lower.includes("permission") && lower.includes("call")) {
+		return `${base}\n\nThe recipient has not granted call permission, or the permission window has expired. Send a Call Permission Request first (up to 5 calls per 24h for 7 days after consent).`;
+	}
+	if (lower.includes("calling") && lower.includes("not enabled")) {
+		return `${base}\n\nCalling is not enabled for this phone number. The number must be Calling-enabled by Meta, at the 1K messaging tier or higher, and in a supported region.`;
+	}
+
 	return base;
 };
 
