@@ -186,10 +186,17 @@ export const processWebhookLog = internalMutation({
 		try {
 			// Parse the payload - it contains messages array
 			const payload = log.payload as {
-				contacts?: Array<{ profile: { name: string }; wa_id: string }>;
+				contacts?: Array<{
+					profile: { name?: string; username?: string };
+					wa_id?: string;
+					user_id?: string;
+					parent_user_id?: string;
+				}>;
 				messages?: Array<{
 					id: string;
-					from: string;
+					from?: string;
+					from_user_id?: string;
+					from_parent_user_id?: string;
 					timestamp: string;
 					type: string;
 					text?: { body: string };
@@ -230,29 +237,81 @@ export const processWebhookLog = internalMutation({
 			}
 
 			for (const msg of payload.messages) {
-				const contactInfo = payload.contacts?.find((c) => c.wa_id === msg.from);
+				// Identity: prefer the BSUID (always present for username users);
+				// fall back to the phone (`from`), which Meta omits when the user has
+				// a username and no recent interaction. See docs/whatsapp-bsuid-usernames.md.
+				const senderUserId = msg.from_user_id;
+				const senderPhone = msg.from;
+				const senderParentUserId = msg.from_parent_user_id;
 
-				// Upsert contact
-				let contact = await ctx.db
-					.query("contacts")
-					.withIndex("by_account_wa_id", (q) =>
-						q.eq("accountId", args.accountId).eq("waId", msg.from),
-					)
-					.first();
+				if (!senderUserId && !senderPhone) {
+					console.warn(
+						"[webhook] Inbound message has neither from nor from_user_id — skipping",
+						{ id: msg.id },
+					);
+					continue;
+				}
+
+				const contactInfo = payload.contacts?.find(
+					(c) =>
+						(senderUserId && c.user_id === senderUserId) ||
+						(senderPhone && c.wa_id === senderPhone),
+				);
+
+				// Resolve contact: BSUID first, then phone. This links an existing
+				// phone-based contact to its BSUID (and vice versa) on later messages.
+				let contact = null;
+				if (senderUserId) {
+					contact = await ctx.db
+						.query("contacts")
+						.withIndex("by_account_user_id", (q) =>
+							q.eq("accountId", args.accountId).eq("userId", senderUserId),
+						)
+						.first();
+				}
+				if (!contact && senderPhone) {
+					contact = await ctx.db
+						.query("contacts")
+						.withIndex("by_account_wa_id", (q) =>
+							q.eq("accountId", args.accountId).eq("waId", senderPhone),
+						)
+						.first();
+				}
 
 				if (!contact) {
 					const contactId = await ctx.db.insert("contacts", {
 						accountId: args.accountId,
-						waId: msg.from,
-						phone: `+${msg.from}`,
+						userId: senderUserId,
+						parentUserId: senderParentUserId,
+						waId: senderPhone,
+						phone: senderPhone ? `+${senderPhone}` : undefined,
+						username: contactInfo?.profile.username,
 						name: contactInfo?.profile.name,
 					});
 					contact = await ctx.db.get(contactId);
-				} else if (
-					contactInfo?.profile.name &&
-					contactInfo.profile.name !== contact.name
-				) {
-					await ctx.db.patch(contact._id, { name: contactInfo.profile.name });
+				} else {
+					// Backfill newly-available identifiers and profile changes.
+					const patch: Record<string, string> = {};
+					if (senderUserId && contact.userId !== senderUserId)
+						patch.userId = senderUserId;
+					if (senderParentUserId && contact.parentUserId !== senderParentUserId)
+						patch.parentUserId = senderParentUserId;
+					if (senderPhone && contact.waId !== senderPhone) {
+						patch.waId = senderPhone;
+						patch.phone = `+${senderPhone}`;
+					}
+					if (
+						contactInfo?.profile.username &&
+						contactInfo.profile.username !== contact.username
+					)
+						patch.username = contactInfo.profile.username;
+					if (
+						contactInfo?.profile.name &&
+						contactInfo.profile.name !== contact.name
+					)
+						patch.name = contactInfo.profile.name;
+					if (Object.keys(patch).length > 0)
+						await ctx.db.patch(contact._id, patch);
 				}
 
 				if (!contact) continue;
@@ -390,6 +449,7 @@ export const processWebhookLog = internalMutation({
 						conversationId: conversation._id,
 						contactId: contact._id,
 						from: msg.from,
+						fromUserId: senderUserId,
 						type: messageType,
 						text: msg.text?.body,
 						caption: (media as { caption?: string })?.caption,

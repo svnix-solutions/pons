@@ -24,7 +24,12 @@ const mediaContentSchema = z
 const webhookMessageSchema = z
 	.object({
 		id: z.string(),
-		from: z.string(),
+		// `from` (phone) is CONDITIONAL — Meta omits it for username users with no
+		// recent interaction. `from_user_id` (BSUID) is always present in that case.
+		// See docs/whatsapp-bsuid-usernames.md.
+		from: z.string().optional(),
+		from_user_id: z.string().optional(),
+		from_parent_user_id: z.string().optional(),
 		timestamp: z.string(),
 		type: z.string(),
 		text: z.object({ body: z.string() }).optional(),
@@ -87,6 +92,8 @@ const webhookStatusSchema = z
 		status: z.string(),
 		timestamp: z.string(),
 		recipient_id: z.string().optional(),
+		recipient_user_id: z.string().optional(),
+		recipient_parent_user_id: z.string().optional(),
 		errors: z
 			.array(
 				z
@@ -110,8 +117,14 @@ const webhookValueSchema = z.object({
 	contacts: z
 		.array(
 			z.object({
-				profile: z.object({ name: z.string() }),
-				wa_id: z.string(),
+				profile: z.object({
+					name: z.string(),
+					username: z.string().optional(),
+				}),
+				// `wa_id` (phone) is conditional; `user_id` (BSUID) is always present.
+				wa_id: z.string().optional(),
+				user_id: z.string().optional(),
+				parent_user_id: z.string().optional(),
 			}),
 		)
 		.optional(),
