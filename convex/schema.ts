@@ -257,14 +257,25 @@ export default defineSchema({
 		.index("by_account_user", ["accountId", "userId"]),
 
 	// Contacts (customers)
+	//
+	// Identity is opaque, not phone-first. `userId` is the stable routing key —
+	// for WhatsApp it's the Business-Scoped User ID (BSUID) once a user adopts a
+	// username; legacy contacts key on `waId` (phone). Meta omits the phone number
+	// (`wa_id`/`from`) for username users with no recent interaction, so `waId` and
+	// `phone` are now optional and treated as attributes to backfill.
+	// See docs/whatsapp-bsuid-usernames.md.
 	contacts: defineTable({
 		accountId: v.id("accounts"),
-		waId: v.string(), // WhatsApp ID (phone number)
-		phone: v.string(), // E.164 format: +491234567890
+		userId: v.optional(v.string()), // BSUID, e.g. "US.13491208655302741918"
+		parentUserId: v.optional(v.string()), // Parent BSUID (multi-portfolio)
+		waId: v.optional(v.string()), // WhatsApp ID (phone) — conditional
+		phone: v.optional(v.string()), // E.164 — only when Meta shares it
+		username: v.optional(v.string()), // WhatsApp username (display only)
 		name: v.optional(v.string()), // Profile name from WhatsApp
 	})
 		.index("by_account", ["accountId"])
-		.index("by_account_wa_id", ["accountId", "waId"]),
+		.index("by_account_wa_id", ["accountId", "waId"])
+		.index("by_account_user_id", ["accountId", "userId"]),
 
 	// Conversations (threads with contacts)
 	conversations: defineTable({
