@@ -898,3 +898,68 @@ export const webhookStatusUpdate = action({
 		});
 	},
 });
+
+/**
+ * Verify and ingest a WhatsApp call lifecycle event (Meta `calls` webhook
+ * field). Same signature-verify-then-ingest pattern as webhookStatusUpdate.
+ */
+export const webhookCallEvent = action({
+	args: {
+		phoneNumberId: v.string(),
+		rawBody: v.string(),
+		signature: v.string(),
+		waCallId: v.string(),
+		event: v.optional(v.string()),
+		status: v.optional(v.string()),
+		timestamp: v.number(),
+		direction: v.optional(v.string()),
+		from: v.optional(v.string()),
+		to: v.optional(v.string()),
+		callbackData: v.optional(v.string()),
+		errorCode: v.optional(v.string()),
+		errorMessage: v.optional(v.string()),
+	},
+	handler: async (ctx, args): Promise<void> => {
+		const account = await ctx.runQuery(
+			internal.accounts.getByPhoneNumberIdInternal,
+			{ phoneNumberId: args.phoneNumberId },
+		);
+
+		if (!account) {
+			throw new Error("Webhook verification failed");
+		}
+
+		if (
+			account.status !== "active" &&
+			account.status !== "pending_name_review"
+		) {
+			return;
+		}
+
+		const isValid = await ctx.runAction(
+			internal.mcpNode.verifyWebhookSignature,
+			{
+				rawBody: args.rawBody,
+				signature: args.signature,
+			},
+		);
+
+		if (!isValid) {
+			throw new Error("Webhook verification failed");
+		}
+
+		await ctx.runMutation(internal.webhook.ingestCallEvent, {
+			accountId: account._id,
+			waCallId: args.waCallId,
+			event: args.event,
+			status: args.status,
+			timestamp: args.timestamp,
+			direction: args.direction,
+			from: args.from,
+			to: args.to,
+			callbackData: args.callbackData,
+			errorCode: args.errorCode,
+			errorMessage: args.errorMessage,
+		});
+	},
+});

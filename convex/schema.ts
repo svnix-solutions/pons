@@ -63,12 +63,16 @@ export const webhookForwardEventType = v.union(
 	v.literal("message.outbound.failed"),
 	v.literal("message.status.updated"),
 	// ── Calling (voice agent) ──
-	// Phase 1 emits the outbound-initiated events below. Inbound webhook-driven
-	// call lifecycle events (ringing/connected/status) are added in Phase 2.
+	// Phase 1 emits the outbound-initiated events (permission.requested /
+	// initiated / terminated / failed). Phase 2 adds the webhook-driven
+	// lifecycle events below.
 	v.literal("call.permission.requested"),
 	v.literal("call.initiated"),
 	v.literal("call.terminated"),
 	v.literal("call.failed"),
+	// Phase 2 — inbound webhook (Meta `calls` field):
+	v.literal("call.inbound.received"), // a user-initiated call arrived
+	v.literal("call.status.updated"), // ringing / connected / completed / rejected
 );
 
 // Lifecycle states for a WhatsApp voice call.

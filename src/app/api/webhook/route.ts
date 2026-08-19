@@ -101,6 +101,41 @@ const webhookStatusSchema = z
 	})
 	.passthrough();
 
+// Call lifecycle event (Meta `calls` webhook field). Tolerant/passthrough —
+// field casing (event/status enums) should be validated against a real payload
+// (Phase 0 spike); we never reject on unknown keys.
+const webhookCallSchema = z
+	.object({
+		id: z.string(),
+		from: z.string().optional(),
+		to: z.string().optional(),
+		to_user_id: z.string().optional(),
+		event: z.string().optional(),
+		status: z.string().optional(),
+		direction: z.string().optional(), // BUSINESS_INITIATED | USER_INITIATED
+		timestamp: z.union([z.string(), z.number()]).optional(),
+		biz_opaque_callback_data: z.string().optional(),
+		session: z
+			.object({
+				sdp_type: z.string().optional(),
+				sdp: z.string().optional(),
+			})
+			.passthrough()
+			.optional(),
+		errors: z
+			.array(
+				z
+					.object({
+						code: z.union([z.number(), z.string()]).optional(),
+						title: z.string().optional(),
+						message: z.string().optional(),
+					})
+					.passthrough(),
+			)
+			.optional(),
+	})
+	.passthrough();
+
 const webhookValueSchema = z.object({
 	messaging_product: z.string(),
 	metadata: z.object({
@@ -117,6 +152,7 @@ const webhookValueSchema = z.object({
 		.optional(),
 	messages: z.array(webhookMessageSchema).optional(),
 	statuses: z.array(webhookStatusSchema).optional(),
+	calls: z.array(webhookCallSchema).optional(),
 	errors: z
 		.array(
 			z.object({
@@ -252,15 +288,19 @@ export async function POST(request: NextRequest) {
 	// Process each change
 	for (const entry of payload.entry) {
 		for (const change of entry.changes) {
-			if (change.field !== "messages") continue;
+			// `messages` carries inbound messages + delivery statuses; `calls`
+			// carries voice-call lifecycle events. Everything else is ignored.
+			if (change.field !== "messages" && change.field !== "calls") continue;
 
 			const value = change.value;
 			const phoneNumberId = value.metadata.phone_number_id;
 
 			console.log("[webhook:POST] Processing", {
+				field: change.field,
 				phoneNumberId,
 				messages: value.messages?.length ?? 0,
 				statuses: value.statuses?.length ?? 0,
+				calls: value.calls?.length ?? 0,
 			});
 
 			// Ingest messages via gateway (verifies signature inside Convex)
@@ -308,6 +348,50 @@ export async function POST(request: NextRequest) {
 						console.error("[webhook:POST] ✗ Failed to ingest status", {
 							waMessageId: status.id,
 							status: status.status,
+							error: String(error),
+						});
+					}
+				}
+			}
+
+			// Ingest call lifecycle events via gateway (verifies signature inside
+			// Convex). Present on the `calls` field.
+			if (value.calls) {
+				for (const call of value.calls) {
+					try {
+						const ts =
+							typeof call.timestamp === "string"
+								? parseInt(call.timestamp, 10) * 1000
+								: typeof call.timestamp === "number"
+									? call.timestamp * 1000
+									: Date.now();
+
+						const result = await convex.action(api.gateway.webhookCallEvent, {
+							phoneNumberId,
+							rawBody: body,
+							signature,
+							waCallId: call.id,
+							event: call.event,
+							status: call.status,
+							timestamp: ts,
+							direction: call.direction,
+							from: call.from,
+							to: call.to,
+							callbackData: call.biz_opaque_callback_data,
+							errorCode: call.errors?.[0]?.code?.toString(),
+							errorMessage: call.errors?.[0]?.title,
+						});
+						console.log("[webhook:POST] Call event result", {
+							waCallId: call.id,
+							event: call.event,
+							status: call.status,
+							result,
+						});
+					} catch (error) {
+						console.error("[webhook:POST] ✗ Failed to ingest call event", {
+							waCallId: call.id,
+							event: call.event,
+							status: call.status,
 							error: String(error),
 						});
 					}
